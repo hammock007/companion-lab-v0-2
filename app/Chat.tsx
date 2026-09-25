@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 
 type Message = {
   id: string;
@@ -17,6 +17,11 @@ export default function Chat({ initialMessages }: ChatProps) {
   const [messages, setMessages] = useState<Message[]>(initialMessages);
   const [input, setInput] = useState("");
   const [isSending, setIsSending] = useState(false);
+  const bottomRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "instant", block: "end" });
+  }, [messages]);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -221,6 +226,7 @@ export default function Chat({ initialMessages }: ChatProps) {
             );
           })
         )}
+        <div ref={bottomRef} />
       </section>
 
       <form onSubmit={handleSubmit}>
