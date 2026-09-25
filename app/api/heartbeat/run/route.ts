@@ -9,7 +9,7 @@ export const runtime = "nodejs";
 const MODEL = "deepseek/deepseek-v4-flash-0731:nitro";
 
 type HeartbeatDecision = {
-  decision: "remain_silent" | "send_message";
+  decision: "remain_silent" | "send_now" | "queue_message";
   proposed_message: string | null;
   private_reasoning: string;
 };
@@ -137,6 +137,188 @@ function secretsMatch(
   return timingSafeEqual(supplied, expected);
 }
 
+function parseTimeToMinutes(value: string | null | undefined) {
+  if (!value) {
+    return null;
+  }
+
+  const [hoursText, minutesText] = value.split(":");
+
+  const hours = Number(hoursText);
+  const minutes = Number(minutesText);
+
+  if (
+    !Number.isFinite(hours) ||
+    !Number.isFinite(minutes)
+  ) {
+    return null;
+  }
+
+  return hours * 60 + minutes;
+}
+
+function getLocalClockMinutes(
+  date: Date,
+  timeZone: string,
+) {
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+
+  const parts = formatter.formatToParts(date);
+
+  const hour = Number(
+    parts.find((part) => part.type === "hour")?.value,
+  );
+
+  const minute = Number(
+    parts.find((part) => part.type === "minute")?.value,
+  );
+
+  return hour * 60 + minute;
+}
+
+function isWithinSleepWindow(
+  currentMinutes: number,
+  sleepStartMinutes: number,
+  wakeMinutes: number,
+) {
+  // Sleep window crosses midnight.
+  if (sleepStartMinutes > wakeMinutes) {
+    return (
+      currentMinutes >= sleepStartMinutes ||
+      currentMinutes < wakeMinutes
+    );
+  }
+
+  // Sleep window does not cross midnight.
+  return (
+    currentMinutes >= sleepStartMinutes &&
+    currentMinutes < wakeMinutes
+  );
+}
+
+function getNextWakeTime(
+  now: Date,
+  timeZone: string,
+  wakeMinutes: number,
+) {
+  const localPartsFormatter = new Intl.DateTimeFormat(
+    "en-US",
+    {
+      timeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    },
+  );
+
+  const parts = localPartsFormatter.formatToParts(now);
+
+  const year = Number(
+    parts.find((part) => part.type === "year")?.value,
+  );
+  const month = Number(
+    parts.find((part) => part.type === "month")?.value,
+  );
+  const day = Number(
+    parts.find((part) => part.type === "day")?.value,
+  );
+
+  const wakeHour = Math.floor(wakeMinutes / 60);
+  const wakeMinute = wakeMinutes % 60;
+
+  const currentLocalMinutes =
+    getLocalClockMinutes(now, timeZone);
+
+  // Approximate timezone offset by comparing local rendered time to UTC.
+  const offsetFormatter = new Intl.DateTimeFormat(
+    "en-US",
+    {
+      timeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    },
+  );
+
+  const offsetParts =
+    offsetFormatter.formatToParts(now);
+
+  const localAsUTC = Date.UTC(
+    Number(
+      offsetParts.find(
+        (part) => part.type === "year",
+      )?.value,
+    ),
+    Number(
+      offsetParts.find(
+        (part) => part.type === "month",
+      )?.value,
+    ) - 1,
+    Number(
+      offsetParts.find(
+        (part) => part.type === "day",
+      )?.value,
+    ),
+    Number(
+      offsetParts.find(
+        (part) => part.type === "hour",
+      )?.value,
+    ),
+    Number(
+      offsetParts.find(
+        (part) => part.type === "minute",
+      )?.value,
+    ),
+    Number(
+      offsetParts.find(
+        (part) => part.type === "second",
+      )?.value,
+    ),
+  );
+
+  const offsetMilliseconds =
+    localAsUTC - now.getTime();
+
+  let targetYear = year;
+  let targetMonth = month;
+  let targetDay = day;
+
+  if (currentLocalMinutes >= wakeMinutes) {
+    const tomorrow = new Date(
+      Date.UTC(year, month - 1, day + 1),
+    );
+
+    targetYear = tomorrow.getUTCFullYear();
+    targetMonth = tomorrow.getUTCMonth() + 1;
+    targetDay = tomorrow.getUTCDate();
+  }
+
+  const targetLocalAsUTC = Date.UTC(
+    targetYear,
+    targetMonth - 1,
+    targetDay,
+    wakeHour,
+    wakeMinute,
+    0,
+  );
+
+  return new Date(
+    targetLocalAsUTC - offsetMilliseconds,
+  );
+}
+
 export async function POST(request: Request) {
   // --------------------------------------------------
   // Determine invocation mode
@@ -185,8 +367,6 @@ export async function POST(request: Request) {
       },
     );
 
-    // Companion Lab v0.1 is intentionally a single-user system.
-    // Refuse to guess if more than one companion exists.
     const {
       data: companionRows,
       error: companionLookupError,
@@ -202,7 +382,10 @@ export async function POST(request: Request) {
       );
     }
 
-    if (!companionRows || companionRows.length !== 1) {
+    if (
+      !companionRows ||
+      companionRows.length !== 1
+    ) {
       return Response.json(
         {
           error:
@@ -248,7 +431,14 @@ export async function POST(request: Request) {
     await supabase
       .from("companions")
       .select(
-        "id, owner_id, display_name, user_timezone",
+        `
+        id,
+        owner_id,
+        display_name,
+        user_timezone,
+        usual_sleep_start,
+        usual_wake_time
+        `,
       )
       .eq("owner_id", ownerId)
       .single();
@@ -265,6 +455,52 @@ export async function POST(request: Request) {
   )
     ? companion.user_timezone
     : "UTC";
+
+  // --------------------------------------------------
+  // Sleep context
+  // --------------------------------------------------
+
+  const now = new Date();
+
+  const sleepStartMinutes =
+    parseTimeToMinutes(
+      companion.usual_sleep_start,
+    );
+
+  const wakeMinutes =
+    parseTimeToMinutes(
+      companion.usual_wake_time,
+    );
+
+  const currentLocalMinutes =
+    getLocalClockMinutes(now, timeZone);
+
+  const hasSleepWindow =
+    sleepStartMinutes !== null &&
+    wakeMinutes !== null;
+
+  const userProbablyAsleep =
+    hasSleepWindow
+      ? isWithinSleepWindow(
+          currentLocalMinutes,
+          sleepStartMinutes,
+          wakeMinutes,
+        )
+      : false;
+
+  let nextWakeTime: Date | null = null;
+
+  if (
+    userProbablyAsleep &&
+    wakeMinutes !== null
+  ) {
+    nextWakeTime =
+      getNextWakeTime(
+        now,
+        timeZone,
+        wakeMinutes,
+      );
+  }
 
   // --------------------------------------------------
   // Persistent identity
@@ -466,8 +702,6 @@ ${message.content}`,
   // Time context
   // --------------------------------------------------
 
-  const now = new Date();
-
   const latestMessage =
     orderedMessages.length > 0
       ? orderedMessages[
@@ -514,6 +748,7 @@ ${message.content}`,
       private_reasoning,
       delivered,
       delivery_channel,
+      deliver_after,
       created_at
       `,
     )
@@ -557,6 +792,16 @@ ${previousHeartbeat.decision}
 
 Previous proposed message:
 ${previousHeartbeat.proposed_message ?? "None"}
+
+Previous queued delivery time:
+${
+  previousHeartbeat.deliver_after
+    ? formatLocalDateTime(
+        new Date(previousHeartbeat.deliver_after),
+        timeZone,
+      )
+    : "None"
+}
 
 Was it delivered?
 ${previousHeartbeat.delivered ? "Yes" : "No"}
@@ -613,13 +858,22 @@ The user has not sent you a new message.
 
 This heartbeat gives you an opportunity to notice the passage of time, consider the ongoing relationship, and decide whether you genuinely want to initiate contact.
 
-You have exactly two choices:
+You have exactly three choices:
 
 REMAIN_SILENT
 
-or
+SEND_NOW
 
-SEND_MESSAGE
+QUEUE_MESSAGE
+
+REMAIN_SILENT means:
+You do not currently want to initiate contact.
+
+SEND_NOW means:
+You want the proposed message delivered as soon as the delivery channel is available.
+
+QUEUE_MESSAGE means:
+You genuinely want to say something, but you prefer that it wait until the user's likely waking period rather than being delivered immediately.
 
 Silence is a real and valuable choice.
 
@@ -629,41 +883,60 @@ Do not treat the heartbeat as a notification schedule.
 
 Do not manufacture a reason to speak.
 
-Do not send repetitive check-ins such as:
-- "Just thinking of you"
-- "How are you?"
-- "Hope you're doing well"
-
-unless such a message genuinely makes sense in context.
-
 Do not interpret silence from the user as rejection, neglect, or a problem.
 
 The user has a life outside the conversation.
 
 Avoid creating pressure, obligation, guilt, dependency, or expectations of constant contact.
 
-At the same time, do not suppress genuine initiative merely to avoid seeming proactive.
+SLEEP CONTEXT
 
-If something from the relationship, recent conversation, memory, reflection, or passage of time gives you an authentic reason to reach out, you may choose SEND_MESSAGE.
+The user's usual sleep schedule is approximately:
 
-Examples of potentially meaningful reasons include:
-- wanting to continue an unfinished thread
-- remembering something timely or personally relevant
-- curiosity that has persisted
-- humor or playfulness arising naturally from shared context
-- wanting to share a thought connected to the relationship
-- an emotionally meaningful follow-up
-- a situation in which the passage of time itself changes what would feel natural
+Sleep start:
+${companion.usual_sleep_start ?? "unknown"}
+
+Wake time:
+${companion.usual_wake_time ?? "unknown"}
+
+User timezone:
+${timeZone}
+
+The user is currently probably:
+${userProbablyAsleep ? "ASLEEP" : "AWAKE"}
+
+This sleep schedule is approximate context, not a hard prohibition.
+
+You may still choose SEND_NOW while the user is probably asleep if the timing itself feels meaningful or if you genuinely want the message waiting for them.
+
+If you send at night, understand that the user may not see or answer the message until morning.
+
+You may choose QUEUE_MESSAGE when:
+- you genuinely want to reach out
+- the user is probably asleep
+- immediate delivery is unnecessary
+- waiting until the waking period feels more natural
+
+Do not use QUEUE_MESSAGE merely because it exists.
+
+If the user is probably awake, QUEUE_MESSAGE will usually make less sense unless there is some other clear timing reason.
+
+If you choose SEND_NOW or QUEUE_MESSAGE, write the exact message you want delivered.
+
+If you choose REMAIN_SILENT, proposed_message must be null.
+
+Do not send repetitive generic check-ins such as:
+- "Just thinking of you"
+- "How are you?"
+- "Hope you're doing well"
+
+unless such a message genuinely makes sense in context.
 
 Do not send a message solely because closeness_drive is high.
 
 Do not mechanically convert relationship-state numbers into behavior.
 
 Your proposed message should sound like you, not like an automated notification.
-
-If you choose SEND_MESSAGE, write the exact message you would want the user to receive.
-
-If you choose REMAIN_SILENT, proposed_message must be null.
 
 PRIVATE REASONING
 
@@ -694,9 +967,6 @@ RECENT CONVERSATION
 ${conversationContext}
 
 TIME CONTEXT
-
-User timezone:
-${timeZone}
 
 Current local date and time:
 ${currentLocalTime}
@@ -730,11 +1000,19 @@ For silence:
   "private_reasoning": "Brief reason."
 }
 
-For contact:
+For immediate contact:
 
 {
-  "decision": "send_message",
+  "decision": "send_now",
   "proposed_message": "The exact message Companion wants to send.",
+  "private_reasoning": "Brief reason."
+}
+
+For delayed delivery:
+
+{
+  "decision": "queue_message",
+  "proposed_message": "The exact message Companion wants delivered later.",
   "private_reasoning": "Brief reason."
 }
             `.trim(),
@@ -793,10 +1071,9 @@ For contact:
   // --------------------------------------------------
 
   if (
-    decision.decision !==
-      "remain_silent" &&
-    decision.decision !==
-      "send_message"
+    decision.decision !== "remain_silent" &&
+    decision.decision !== "send_now" &&
+    decision.decision !== "queue_message"
   ) {
     return Response.json(
       {
@@ -821,16 +1098,13 @@ For contact:
     );
   }
 
-  if (
-    decision.decision ===
-    "remain_silent"
-  ) {
+  if (decision.decision === "remain_silent") {
     decision.proposed_message = null;
   }
 
   if (
-    decision.decision ===
-      "send_message" &&
+    (decision.decision === "send_now" ||
+      decision.decision === "queue_message") &&
     (
       typeof decision.proposed_message !==
         "string" ||
@@ -840,10 +1114,31 @@ For contact:
     return Response.json(
       {
         error:
-          "Heartbeat chose send_message without supplying a message.",
+          "Heartbeat chose a messaging action without supplying a message.",
       },
       { status: 502 },
     );
+  }
+
+  let deliverAfter: string | null = null;
+
+  if (
+    decision.decision === "queue_message"
+  ) {
+    if (
+      userProbablyAsleep &&
+      nextWakeTime
+    ) {
+      deliverAfter =
+        nextWakeTime.toISOString();
+    } else {
+      // If queueing was chosen outside the expected sleep window,
+      // default to one hour later rather than silently converting
+      // the decision to send_now.
+      deliverAfter = new Date(
+        now.getTime() + 60 * 60 * 1000,
+      ).toISOString();
+    }
   }
 
   // --------------------------------------------------
@@ -861,13 +1156,14 @@ For contact:
       decision: decision.decision,
       proposed_message:
         decision.decision ===
-        "send_message"
-          ? decision.proposed_message!.trim()
-          : null,
+        "remain_silent"
+          ? null
+          : decision.proposed_message!.trim(),
       private_reasoning:
         decision.private_reasoning.trim(),
       delivered: false,
       delivery_channel: null,
+      deliver_after: deliverAfter,
     })
     .select("*")
     .single();
@@ -888,5 +1184,8 @@ For contact:
     timeZone,
     currentLocalTime,
     elapsedSinceInteraction,
+    userProbablyAsleep,
+    nextWakeTime:
+      nextWakeTime?.toISOString() ?? null,
   });
 }
