@@ -172,28 +172,14 @@ export default function Chat({ initialMessages }: ChatProps) {
                 style={{
                   display: "flex",
                   justifyContent: isUser ? "flex-end" : "flex-start",
+                  alignItems: "flex-start",
                   marginBottom: "1.4rem",
                 }}
               >
-                {!isUser && (
-                  <img
-                    src="/companion-avatar.jpg"
-                    alt="Companion"
-                    style={{
-                      width: "120px",
-                      height: "120px",
-                      borderRadius: "10px",
-                      objectFit: "cover",
-                      objectPosition: "center",
-                      marginRight: "0.9rem",
-                      flexShrink: 0,
-                    }}
-                  />
-                )}
-
                 <div
                   style={{
-                    maxWidth: "75%",
+                    maxWidth: isUser ? "75%" : "calc(100% - 135px)",
+                    minWidth: 0,
                     padding: "0.9rem 1rem",
                     borderRadius: "14px",
                     backgroundColor: isUser
@@ -214,6 +200,7 @@ export default function Chat({ initialMessages }: ChatProps) {
                   <div
                     style={{
                       whiteSpace: "pre-wrap",
+                      overflowWrap: "break-word",
                     }}
                   >
                     {message.content ||
@@ -222,6 +209,22 @@ export default function Chat({ initialMessages }: ChatProps) {
                         : "")}
                   </div>
                 </div>
+
+                {!isUser && (
+                  <img
+                    src="/companion-avatar.jpg"
+                    alt="Companion"
+                    style={{
+                      width: "120px",
+                      height: "120px",
+                      borderRadius: "10px",
+                      objectFit: "cover",
+                      objectPosition: "center",
+                      marginLeft: "0.9rem",
+                      flexShrink: 0,
+                    }}
+                  />
+                )}
               </div>
             );
           })
