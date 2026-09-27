@@ -319,6 +319,51 @@ function getNextWakeTime(
   );
 }
 
+type TelegramSendResult = {
+  ok?: boolean;
+  result?: {
+    message_id?: number;
+  };
+  description?: string;
+};
+
+async function sendTelegramMessage(message: string) {
+  const botToken = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+
+  if (!botToken || !chatId) {
+    throw new Error(
+      "Telegram delivery is not configured. TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are required.",
+    );
+  }
+
+  const telegramResponse = await fetch(
+    `https://api.telegram.org/bot${botToken}/sendMessage`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: message,
+      }),
+    },
+  );
+
+  const telegramJson =
+    (await telegramResponse.json()) as TelegramSendResult;
+
+  if (!telegramResponse.ok || !telegramJson.ok) {
+    throw new Error(
+      telegramJson.description ??
+        `Telegram sendMessage failed with status ${telegramResponse.status}.`,
+    );
+  }
+
+  return telegramJson.result?.message_id ?? null;
+}
+
 export async function POST(request: Request) {
   // --------------------------------------------------
   // Determine invocation mode
@@ -1175,8 +1220,163 @@ For delayed delivery:
     );
   }
 
+  // --------------------------------------------------
+  // Deliver SEND_NOW through Telegram
+  // --------------------------------------------------
+
+  let heartbeatForResponse = savedHeartbeat;
+
+  let telegramDelivery:
+    | {
+        attempted: false;
+        delivered: false;
+      }
+    | {
+        attempted: true;
+        delivered: true;
+        telegramMessageId: number | null;
+        historyRecorded: boolean;
+      }
+    | {
+        attempted: true;
+        delivered: false;
+        error: string;
+      } = {
+    attempted: false,
+    delivered: false,
+  };
+
+  if (
+    decision.decision === "send_now" &&
+    decision.proposed_message
+  ) {
+    try {
+      const telegramMessageId =
+        await sendTelegramMessage(
+          decision.proposed_message.trim(),
+        );
+
+      const {
+        data: deliveredHeartbeat,
+        error: deliveryUpdateError,
+      } = await supabase
+        .from("companion_heartbeats")
+        .update({
+          delivered: true,
+          delivery_channel: "telegram",
+        })
+        .eq("id", savedHeartbeat.id)
+        .select("*")
+        .single();
+
+      if (deliveryUpdateError) {
+        console.error(
+          "Telegram message was sent, but heartbeat delivery state could not be updated:",
+          deliveryUpdateError,
+        );
+      } else if (deliveredHeartbeat) {
+        heartbeatForResponse = deliveredHeartbeat;
+      }
+
+      // Record the proactive Telegram message in the same
+      // persistent conversation history used by normal app chat.
+      let {
+        data: conversation,
+        error: conversationError,
+      } = await supabase
+        .from("conversations")
+        .select("id, started_at")
+        .eq("owner_id", ownerId)
+        .eq("companion_id", companion.id)
+        .is("ended_at", null)
+        .order("started_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (conversationError) {
+        console.error(
+          "Telegram message was sent, but the open conversation could not be loaded:",
+          conversationError,
+        );
+      }
+
+      if (!conversation && !conversationError) {
+        const {
+          data: createdConversation,
+          error: createConversationError,
+        } = await supabase
+          .from("conversations")
+          .insert({
+            owner_id: ownerId,
+            companion_id: companion.id,
+          })
+          .select("id, started_at")
+          .single();
+
+        if (createConversationError) {
+          console.error(
+            "Telegram message was sent, but a conversation could not be created:",
+            createConversationError,
+          );
+        } else {
+          conversation = createdConversation;
+        }
+      }
+
+      let historyRecorded = false;
+
+      if (conversation) {
+        const { error: messageInsertError } =
+          await supabase
+            .from("messages")
+            .insert({
+              owner_id: ownerId,
+              companion_id: companion.id,
+              conversation_id: conversation.id,
+              role: "assistant",
+              content:
+                decision.proposed_message.trim(),
+              provider: "openrouter",
+              model: MODEL,
+            });
+
+        if (messageInsertError) {
+          console.error(
+            "Telegram message was sent, but the proactive message could not be recorded in conversation history:",
+            messageInsertError,
+          );
+        } else {
+          historyRecorded = true;
+        }
+      }
+
+      telegramDelivery = {
+        attempted: true,
+        delivered: true,
+        telegramMessageId,
+        historyRecorded,
+      };
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : "Unknown Telegram delivery error.";
+
+      console.error(
+        "Telegram heartbeat delivery failed:",
+        message,
+      );
+
+      telegramDelivery = {
+        attempted: true,
+        delivered: false,
+        error: message,
+      };
+    }
+  }
+
   return Response.json({
-    heartbeat: savedHeartbeat,
+    heartbeat: heartbeatForResponse,
     invocationMode:
       isAutonomousInvocation
         ? "autonomous"
@@ -1187,5 +1387,6 @@ For delayed delivery:
     userProbablyAsleep,
     nextWakeTime:
       nextWakeTime?.toISOString() ?? null,
+    telegramDelivery,
   });
 }
