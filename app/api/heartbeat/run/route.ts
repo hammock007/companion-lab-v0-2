@@ -1085,11 +1085,30 @@ For delayed delivery:
   const rawContent =
     json?.choices?.[0]?.message?.content?.trim();
 
-  if (!rawContent) {
+    if (!rawContent) {
+    const diagnostics = {
+      responseId: json?.id ?? null,
+      model: json?.model ?? null,
+      provider: json?.provider ?? null,
+      finishReason: json?.choices?.[0]?.finish_reason ?? null,
+      nativeFinishReason:
+        json?.choices?.[0]?.native_finish_reason ?? null,
+      usage: json?.usage ?? null,
+      hasReasoning: Boolean(
+        json?.choices?.[0]?.message?.reasoning ||
+        json?.choices?.[0]?.message?.reasoning_details?.length
+      ),
+      hasError: Boolean(
+        json?.error || json?.choices?.[0]?.error
+      ),
+    };
+
+    console.error("Empty heartbeat response:", diagnostics);
+
     return Response.json(
       {
-        error:
-          "Heartbeat returned no content.",
+        error: "Heartbeat returned no content.",
+        diagnostics,
       },
       { status: 502 },
     );
