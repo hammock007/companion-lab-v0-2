@@ -1143,6 +1143,8 @@ For delayed delivery:
       {
         error:
           "Heartbeat returned an invalid decision.",
+         returnedDecision: decision?.decision ?? null,
+         returnedKeys: Object.keys(decision ?? {}),
       },
       { status: 502 },
     );
